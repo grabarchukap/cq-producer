@@ -10,16 +10,23 @@ from bot.keyboards import (
     back_button,
     bool_field_buttons,
     cancel_auth_button,
+    case_question_delete_confirm,
+    case_question_detail_buttons,
+    case_questions_list,
     examples_keyboard,
     lang_field_buttons,
     main_menu,
+    notifiers_menu,
     post_structure_menu,
     profile_edit_menu,
     profile_list_keyboard,
     prompts_menu,
+    stuck_tasks_menu,
     text_field_buttons,
 )
 from bot.states import AdminState
+import case_questions.loader as cq_loader
+from agents.gdocs import load_draft_prompt, save_draft_prompt
 from config import ADMIN_PASSWORD
 
 logger = logging.getLogger(__name__)
@@ -35,6 +42,7 @@ _K_ADMIN_TRIGGER_MSG  = "admin_trigger_msg_id"
 _K_MENU_MSG           = "main_menu_msg_id"      # shared with handlers.py
 _K_EDIT_PROFILE       = "admin_edit_profile_id"
 _K_EDIT_FIELD         = "admin_edit_field_name"
+_K_EDIT_Q_IDX         = "admin_cq_edit_idx"
 
 # ── Profile field metadata ────────────────────────────────────────────────────
 
@@ -410,6 +418,64 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         except ValueError:
             await edit_admin("Введи числовой Telegram user_id:", reply_markup=back_button())
 
+    # ── Edit draft prompt ─────────────────────────────────────────────────────
+    elif state == AdminState.AWAIT_DRAFT_PROMPT:
+        await _try_delete(update.message)
+        try:
+            save_draft_prompt(text)
+            context.user_data[_K_STATE] = AdminState.MENU
+            preview = text[:300]
+            await edit_admin(
+                f"✅ Промпт сохранён.\n\n<code>{preview}{'…' if len(text) > 300 else ''}</code>",
+                parse_mode="HTML", reply_markup=admin_menu(),
+            )
+        except Exception as exc:
+            await edit_admin(f"Ошибка сохранения: {exc}", reply_markup=back_button())
+
+    # ── Add notifier ──────────────────────────────────────────────────────────
+    elif state == AdminState.AWAIT_NOTIFIER_ADD:
+        await _try_delete(update.message)
+        try:
+            uid = int(text)
+            await db.add_notifier(uid)
+            notifiers = await db.list_notifiers()
+            context.user_data[_K_STATE] = AdminState.MENU
+            await edit_admin(
+                f"Получатель <code>{uid}</code> добавлен.",
+                parse_mode="HTML", reply_markup=notifiers_menu(notifiers),
+            )
+        except ValueError:
+            await edit_admin(
+                "Введи числовой Telegram user_id:", reply_markup=back_button(),
+            )
+
+    # ── Add case question ─────────────────────────────────────────────────────
+    elif state == AdminState.AWAIT_CASE_Q_ADD:
+        await _try_delete(update.message)
+        try:
+            questions = cq_loader.add_question(text)
+            context.user_data[_K_STATE] = AdminState.MENU
+            await edit_admin(
+                f"Вопрос добавлен (всего: {len(questions)}).",
+                reply_markup=case_questions_list(questions),
+            )
+        except Exception as exc:
+            await edit_admin(f"Ошибка: {exc}", reply_markup=back_button())
+
+    # ── Edit case question ────────────────────────────────────────────────────
+    elif state == AdminState.AWAIT_CASE_Q_EDIT:
+        await _try_delete(update.message)
+        idx = context.user_data.get(_K_EDIT_Q_IDX, 0)
+        try:
+            questions = cq_loader.update_question(idx, text)
+            context.user_data[_K_STATE] = AdminState.MENU
+            await edit_admin(
+                f"Вопрос {idx + 1} обновлён.",
+                reply_markup=case_questions_list(questions),
+            )
+        except Exception as exc:
+            await edit_admin(f"Ошибка: {exc}", reply_markup=back_button())
+
     # ── Edit profile field (text input) ───────────────────────────────────────
     elif state == AdminState.AWAIT_EDIT_TEXT:
         await _try_delete(update.message)
@@ -722,3 +788,168 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             "Пользователи:\n" + "\n".join(lines),
             parse_mode="HTML", reply_markup=back_button(),
         )
+
+    # ── Draft prompt editing ──────────────────────────────────────────────────
+    elif action == "draft_prompt":
+        current = load_draft_prompt()
+        preview = current[:800]
+        context.user_data[_K_STATE] = AdminState.AWAIT_DRAFT_PROMPT
+        await query.edit_message_text(
+            f"🖊 <b>Промпт черновика кейса</b>\n\n"
+            f"<b>Текущий промпт:</b>\n<code>{preview}{'…' if len(current) > 800 else ''}</code>\n\n"
+            f"Отправь новый текст промпта:",
+            parse_mode="HTML", reply_markup=back_button(),
+        )
+
+    # ── Stuck tasks monitoring ────────────────────────────────────────────────
+    elif action == "stuck":
+        pending = await db.get_pending_cases()
+        context.user_data[_K_STATE] = AdminState.MENU
+        text = (
+            f"⚠️ Зависших задач: {len(pending)}"
+            if pending else
+            "✅ Зависших задач нет."
+        )
+        await query.edit_message_text(text, reply_markup=stuck_tasks_menu(pending))
+
+    elif action == "stuck_del":
+        case_id = int(parts[2]) if len(parts) > 2 else 0
+        await db.delete_case(case_id)
+        pending = await db.get_pending_cases()
+        await query.edit_message_text(
+            f"Кейс #{case_id} удалён. Зависших: {len(pending)}.",
+            reply_markup=stuck_tasks_menu(pending),
+        )
+
+    elif action == "stuck_retry":
+        from agents.gdocs import export_case
+        pending = await db.get_pending_cases()
+        if not pending:
+            await query.edit_message_text("Нет задач для повтора.", reply_markup=back_button())
+            return
+        await query.edit_message_text(f"🔄 Запускаю повтор {len(pending)} кейса(ов)...")
+        notifiers = await db.list_notifiers()
+        success = 0
+        failed = 0
+        import json as _json
+        for row in pending:
+            answers = _json.loads(row["answers"])
+            username = row.get("username")
+            try:
+                url = await export_case(answers=answers, username=username)
+                await db.update_case_status(row["id"], "done")
+                first_answer = (answers[0].get("answer") or "").strip() if answers else ""
+                author_part = f"@{username}" if username else "пользователь"
+                text = (
+                    f"📋 Новый кейс от {author_part}\n"
+                    f"Клиент: {first_answer or '—'}\n\n"
+                    f"👉 <a href=\"{url}\">Открыть документ</a>"
+                )
+                for notifier in notifiers:
+                    try:
+                        await context.bot.send_message(
+                            notifier["user_id"], text, parse_mode="HTML",
+                            disable_web_page_preview=True,
+                        )
+                    except Exception:
+                        pass
+                success += 1
+            except Exception as exc:
+                logger.warning("Retry failed for case %s: %s", row["id"], exc)
+                failed += 1
+        pending_now = await db.get_pending_cases()
+        result = f"✅ Успешно: {success}"
+        if failed:
+            result += f"\n❌ Не удалось: {failed}"
+        await context.bot.edit_message_text(
+            result, chat_id=chat_id, message_id=admin_msg_id,
+            reply_markup=stuck_tasks_menu(pending_now),
+        )
+
+    # ── Notifiers management ──────────────────────────────────────────────────
+    elif action == "notifiers":
+        notifiers = await db.list_notifiers()
+        context.user_data[_K_STATE] = AdminState.MENU
+        count = len(notifiers)
+        await query.edit_message_text(
+            f"Получатели уведомлений о кейсах ({count}):",
+            reply_markup=notifiers_menu(notifiers),
+        )
+
+    elif action == "notifier_add":
+        context.user_data[_K_STATE] = AdminState.AWAIT_NOTIFIER_ADD
+        await query.edit_message_text(
+            "Введи Telegram user_id пользователя (числовой):", reply_markup=back_button(),
+        )
+
+    elif action == "notifier_del":
+        uid = int(parts[2]) if len(parts) > 2 else 0
+        await db.remove_notifier(uid)
+        notifiers = await db.list_notifiers()
+        context.user_data[_K_STATE] = AdminState.MENU
+        await query.edit_message_text(
+            f"Получатель <code>{uid}</code> удалён.",
+            parse_mode="HTML", reply_markup=notifiers_menu(notifiers),
+        )
+
+    # ── Case question management ──────────────────────────────────────────────
+    elif action == "case_questions":
+        questions = cq_loader.load_questions()
+        context.user_data[_K_STATE] = AdminState.MENU
+        await query.edit_message_text(
+            f"Вопросы кейса ({len(questions)} шт.):",
+            reply_markup=case_questions_list(questions),
+        )
+
+    elif action == "cq_view":
+        idx = int(parts[2]) if len(parts) > 2 else 0
+        questions = cq_loader.load_questions()
+        if not (0 <= idx < len(questions)):
+            await query.edit_message_text("Вопрос не найден.", reply_markup=back_button())
+            return
+        await query.edit_message_text(
+            f"<b>Вопрос {idx + 1}</b>\n\n{questions[idx]['text']}",
+            parse_mode="HTML", reply_markup=case_question_detail_buttons(idx),
+        )
+
+    elif action == "cq_add":
+        context.user_data[_K_STATE] = AdminState.AWAIT_CASE_Q_ADD
+        await query.edit_message_text(
+            "Введи текст нового вопроса:", reply_markup=back_button(),
+        )
+
+    elif action == "cq_edit":
+        idx = int(parts[2]) if len(parts) > 2 else 0
+        questions = cq_loader.load_questions()
+        if not (0 <= idx < len(questions)):
+            await query.edit_message_text("Вопрос не найден.", reply_markup=back_button())
+            return
+        context.user_data[_K_EDIT_Q_IDX] = idx
+        context.user_data[_K_STATE] = AdminState.AWAIT_CASE_Q_EDIT
+        await query.edit_message_text(
+            f"<b>Текущий текст вопроса {idx + 1}:</b>\n\n{questions[idx]['text']}\n\nОтправь новый текст:",
+            parse_mode="HTML", reply_markup=back_button(),
+        )
+
+    elif action == "cq_del":
+        idx = int(parts[2]) if len(parts) > 2 else 0
+        questions = cq_loader.load_questions()
+        if not (0 <= idx < len(questions)):
+            await query.edit_message_text("Вопрос не найден.", reply_markup=back_button())
+            return
+        await query.edit_message_text(
+            f"Удалить вопрос {idx + 1}?\n\n<i>{questions[idx]['text']}</i>",
+            parse_mode="HTML", reply_markup=case_question_delete_confirm(idx),
+        )
+
+    elif action == "cq_del_yes":
+        idx = int(parts[2]) if len(parts) > 2 else 0
+        try:
+            questions = cq_loader.delete_question(idx)
+            context.user_data[_K_STATE] = AdminState.MENU
+            await query.edit_message_text(
+                f"Вопрос удалён. Осталось: {len(questions)}.",
+                reply_markup=case_questions_list(questions),
+            )
+        except Exception as exc:
+            await query.edit_message_text(f"Ошибка: {exc}", reply_markup=back_button())

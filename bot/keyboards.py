@@ -70,6 +70,10 @@ def admin_menu() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("👤 Добавить пользователя", callback_data="adm:add_user")],
         [InlineKeyboardButton("🚫 Удалить пользователя",  callback_data="adm:del_user")],
         [InlineKeyboardButton("📋 Список пользователей",  callback_data="adm:list_users")],
+        [InlineKeyboardButton("📝 Вопросы кейса →",        callback_data="adm:case_questions")],
+        [InlineKeyboardButton("🔔 Получатели уведомлений →", callback_data="adm:notifiers")],
+        [InlineKeyboardButton("🖊 Промпт черновика кейса",  callback_data="adm:draft_prompt")],
+        [InlineKeyboardButton("⚠️ Зависшие задачи →",      callback_data="adm:stuck")],
         [InlineKeyboardButton("🚪 Выйти из админки",      callback_data="adm:exit")],
     ])
 
@@ -176,3 +180,112 @@ def back_button() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("◀️ Назад в меню", callback_data="adm:back")]
     ])
+
+
+# ---------------------------------------------------------------------------
+# Case interview keyboards
+# ---------------------------------------------------------------------------
+
+def case_question_buttons() -> InlineKeyboardMarkup:
+    """Buttons shown under each mandatory question."""
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("⏭ Пропустить", callback_data="case:skip"),
+        InlineKeyboardButton("✅ Завершить",  callback_data="case:done"),
+        InlineKeyboardButton("❌ Отменить",   callback_data="case:cancel"),
+    ]])
+
+
+def case_extra_buttons() -> InlineKeyboardMarkup:
+    """Button shown under the free-form extra question (question 14)."""
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton(
+            "Нет, я честно-честно всё рассказал.",
+            callback_data="case:extra_done",
+        ),
+    ]])
+
+
+def case_confirm_skip_buttons() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("Да, пропустить", callback_data="case:yes_skip"),
+        InlineKeyboardButton("Нет, отвечу",    callback_data="case:no"),
+    ]])
+
+
+def case_confirm_done_buttons() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("Да, завершить",  callback_data="case:yes_done"),
+        InlineKeyboardButton("Нет, продолжу",  callback_data="case:no"),
+    ]])
+
+
+def case_confirm_cancel_buttons() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("Да, отменить",   callback_data="case:yes_cancel"),
+        InlineKeyboardButton("Нет, продолжу",  callback_data="case:no"),
+    ]])
+
+
+# ---------------------------------------------------------------------------
+# Admin — case question management keyboards
+# ---------------------------------------------------------------------------
+
+def case_questions_list(questions: list[dict]) -> InlineKeyboardMarkup:
+    """List of questions; each opens the detail/edit view."""
+    rows = [
+        [InlineKeyboardButton(
+            f"{i + 1}. {q['text'][:55]}{'…' if len(q['text']) > 55 else ''}",
+            callback_data=f"adm:cq_view:{i}",
+        )]
+        for i, q in enumerate(questions)
+    ]
+    rows.append([InlineKeyboardButton("➕ Добавить вопрос", callback_data="adm:cq_add")])
+    rows.append([InlineKeyboardButton("◀️ Назад",           callback_data="adm:back")])
+    return InlineKeyboardMarkup(rows)
+
+
+def case_question_detail_buttons(idx: int) -> InlineKeyboardMarkup:
+    """Edit / Delete buttons for a single question."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✏️ Редактировать",     callback_data=f"adm:cq_edit:{idx}"),
+         InlineKeyboardButton("🗑 Удалить",            callback_data=f"adm:cq_del:{idx}")],
+        [InlineKeyboardButton("◀️ К списку вопросов", callback_data="adm:case_questions")],
+    ])
+
+
+def stuck_tasks_menu(pending_cases: list[dict]) -> InlineKeyboardMarkup:
+    """List of pending (stuck) cases with delete buttons + retry all."""
+    rows = []
+    for case in pending_cases:
+        import json as _json
+        try:
+            answers = _json.loads(case.get("answers", "[]"))
+            first = (answers[0].get("answer") or "").strip()[:40] if answers else ""
+        except Exception:
+            first = ""
+        date = str(case.get("created_at", ""))[:10]
+        author = f"@{case['username']}" if case.get("username") else f"id{case['user_id']}"
+        label = f"🗑 {date} {author}{': ' + first if first else ''}"
+        rows.append([InlineKeyboardButton(label, callback_data=f"adm:stuck_del:{case['id']}")])
+    if pending_cases:
+        rows.append([InlineKeyboardButton("🔄 Повторить всё", callback_data="adm:stuck_retry")])
+    rows.append([InlineKeyboardButton("◀️ Назад", callback_data="adm:back")])
+    return InlineKeyboardMarkup(rows)
+
+
+def notifiers_menu(notifiers: list[dict]) -> InlineKeyboardMarkup:
+    """List of notifiers with delete buttons + add button."""
+    rows = []
+    for n in notifiers:
+        label = f"🗑 @{n['username'] or n['user_id']}"
+        rows.append([InlineKeyboardButton(label, callback_data=f"adm:notifier_del:{n['user_id']}")])
+    rows.append([InlineKeyboardButton("➕ Добавить получателя", callback_data="adm:notifier_add")])
+    rows.append([InlineKeyboardButton("◀️ Назад",               callback_data="adm:back")])
+    return InlineKeyboardMarkup(rows)
+
+
+def case_question_delete_confirm(idx: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Да, удалить", callback_data=f"adm:cq_del_yes:{idx}"),
+        InlineKeyboardButton("◀️ Нет",         callback_data=f"adm:cq_view:{idx}"),
+    ]])

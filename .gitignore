@@ -63,3 +63,6 @@ storage/*.db-shm
 *.log
 tempCodeRunnerFile.py
 .pypirc
+google_credentials.json
+credentials.json
+token.json

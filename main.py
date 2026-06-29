@@ -9,16 +9,54 @@ from telegram.ext import (
     filters,
 )
 
+import asyncio
+
 import config
+from agents.gdocs import export_case
 from bot import admin, handlers, router
 from profiles.loader import load_profiles
-from storage.db import init_db
+from storage.db import get_pending_cases, init_db, list_notifiers, update_case_status
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+
+async def _retry_pending_cases(bot) -> None:
+    """On startup, retry export for any cases that didn't make it last time."""
+    pending = await get_pending_cases()
+    if not pending:
+        return
+    logger.info("Found %d pending case(s) — retrying export", len(pending))
+    notifiers = await list_notifiers()
+    for row in pending:
+        import json as _json
+        case_id = row["id"]
+        answers = _json.loads(row["answers"])
+        username = row.get("username")
+        try:
+            url = await export_case(answers=answers, username=username)
+            await update_case_status(case_id, "done")
+            # Notify
+            first_answer = (answers[0].get("answer") or "").strip() if answers else ""
+            author_part = f"@{username}" if username else "пользователь"
+            text = (
+                f"📋 Новый кейс от {author_part}\n"
+                f"Клиент: {first_answer or '—'}\n\n"
+                f"👉 <a href=\"{url}\">Открыть документ</a>"
+            )
+            for notifier in notifiers:
+                try:
+                    await bot.send_message(
+                        notifier["user_id"], text, parse_mode="HTML",
+                        disable_web_page_preview=True,
+                    )
+                except Exception as exc:
+                    logger.warning("Notify failed for %s: %s", notifier["user_id"], exc)
+        except Exception as exc:
+            logger.error("Retry export failed for case %s: %s", case_id, exc)
 
 
 async def post_init(application: Application) -> None:
@@ -30,6 +68,7 @@ async def post_init(application: Application) -> None:
     ])
     mode = "polling" if config.DEV_MODE else "webhook"
     logger.info("Initialisation complete — %s mode", mode)
+    asyncio.create_task(_retry_pending_cases(application.bot))
 
 
 def main() -> None:
@@ -74,7 +113,6 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    import asyncio
     # Python 3.12+ no longer implicitly creates an event loop.
     # PTB 21 calls asyncio.get_event_loop() internally inside run_polling/run_webhook,
     # so we must set one explicitly before calling main().

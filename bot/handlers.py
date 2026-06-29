@@ -117,15 +117,17 @@ async def on_new_post(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 @require_auth
 async def on_case(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Placeholder — silently returns to main menu (always treated as back)."""
-    await _try_delete(update.message)
+    """Start the case interview flow."""
+    from bot import case as case_module
+
+    btn_msg_id = update.message.message_id
     chat_id = update.effective_chat.id
     await _delete_msg(context, chat_id, _K_MENU_MSG)
 
     rm = await update.message.reply_text(".", reply_markup=ReplyKeyboardRemove())
     await rm.delete()
-    msg = await update.message.reply_text("Главное меню:", reply_markup=main_menu())
-    context.user_data[_K_MENU_MSG] = msg.message_id
+
+    await case_module.start_case(update, context, btn_msg_id)
 
 
 # ---------------------------------------------------------------------------
