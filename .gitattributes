@@ -1,0 +1,12 @@
+# Normalize line endings on commit; check out with platform-native endings
+* text=auto
+
+# Windows scripts — must always be CRLF or cmd.exe won't run them
+*.bat text eol=crlf
+
+# Python and config files — LF everywhere
+*.py  text eol=lf
+*.md  text eol=lf
+*.txt text eol=lf
+*.json text eol=lf
+*.env  text eol=lf
