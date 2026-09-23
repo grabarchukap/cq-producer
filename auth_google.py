@@ -1,7 +1,8 @@
 """
 Run this script once locally to authorize Google API access.
 It will open a browser window — log in and click Allow.
-A token.json file will be saved. Copy it to the server alongside .env.
+A token.json file will be saved. Copy it to the data directory on the server
+(./data when running via docker-compose, alongside .env otherwise).
 
 Usage:
     python auth_google.py
@@ -31,7 +32,7 @@ def main():
 
     Path(TOKEN_FILE).write_text(creds.to_json(), encoding="utf-8")
     print(f"\nAuthorization successful! Token saved to {TOKEN_FILE}")
-    print(f"Copy {TOKEN_FILE} to your server alongside .env")
+    print(f"Copy {TOKEN_FILE} to the bot's data directory (./data for docker-compose)")
 
 
 if __name__ == "__main__":

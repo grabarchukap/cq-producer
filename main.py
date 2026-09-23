@@ -1,3 +1,4 @@
+import json
 import logging
 
 from telegram import BotCommand, Update
@@ -12,15 +13,18 @@ from telegram.ext import (
 import asyncio
 
 import config
-from agents.gdocs import export_case
 from bot import admin, handlers, router
+from bot.case import export_and_notify
 from profiles.loader import load_profiles
-from storage.db import get_pending_cases, init_db, list_notifiers, update_case_status
+from storage.db import get_pending_cases, init_db
+from utils.data_dir import ensure_data_dir
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
+# httpx logs every request URL at INFO, and Telegram API URLs contain the bot token
+logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 
@@ -30,37 +34,15 @@ async def _retry_pending_cases(bot) -> None:
     if not pending:
         return
     logger.info("Found %d pending case(s) — retrying export", len(pending))
-    notifiers = await list_notifiers()
     for row in pending:
-        import json as _json
-        case_id = row["id"]
-        answers = _json.loads(row["answers"])
-        username = row.get("username")
-        try:
-            url = await export_case(answers=answers, username=username)
-            await update_case_status(case_id, "done")
-            # Notify
-            first_answer = (answers[0].get("answer") or "").strip() if answers else ""
-            author_part = f"@{username}" if username else "пользователь"
-            text = (
-                f"📋 Новый кейс от {author_part}\n"
-                f"Клиент: {first_answer or '—'}\n\n"
-                f"👉 <a href=\"{url}\">Открыть документ</a>"
-            )
-            for notifier in notifiers:
-                try:
-                    await bot.send_message(
-                        notifier["user_id"], text, parse_mode="HTML",
-                        disable_web_page_preview=True,
-                    )
-                except Exception as exc:
-                    logger.warning("Notify failed for %s: %s", notifier["user_id"], exc)
-        except Exception as exc:
-            logger.error("Retry export failed for case %s: %s", case_id, exc)
+        await export_and_notify(
+            bot, row["id"], json.loads(row["answers"]), row.get("username")
+        )
 
 
 async def post_init(application: Application) -> None:
     """Runs once after the Application is fully initialised."""
+    ensure_data_dir()
     await init_db()
     load_profiles()
     await application.bot.set_my_commands([

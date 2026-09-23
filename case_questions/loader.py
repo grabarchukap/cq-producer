@@ -1,7 +1,6 @@
 import json
-from pathlib import Path
 
-_QUESTIONS_PATH = Path(__file__).parent / "questions.json"
+from config import QUESTIONS_PATH as _QUESTIONS_PATH
 
 
 def load_questions() -> list[dict]:

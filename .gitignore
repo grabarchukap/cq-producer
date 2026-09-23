@@ -20,6 +20,7 @@ venv.bak/
 
 # Environment & secrets
 .env
+.env-old
 .envrc
 
 # IDE & AI tools
@@ -53,6 +54,9 @@ dmypy.json
 # Build tools
 .pdm-python
 .pdm-build/
+
+# Runtime data directory (DATA_DIR — database, profiles, questions, token)
+data/
 
 # Project database (runtime artifact — do not commit)
 storage/*.db

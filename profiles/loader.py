@@ -2,13 +2,13 @@ import json
 import logging
 import re
 import time
-from pathlib import Path
 from pydantic import ValidationError
+from config import AUTHORS_DIR, TEMPLATE_PATH
 from profiles.schema import AuthorProfile
 
 logger = logging.getLogger(__name__)
 
-_AUTHORS_DIR = Path(__file__).parent / "authors"
+_AUTHORS_DIR = AUTHORS_DIR
 _cache: dict[str, AuthorProfile] = {}
 
 # Cyrillic → Latin transliteration table for slug generation
@@ -70,8 +70,7 @@ def _slug(name: str) -> str:
 
 def create_profile(display_name: str, tone_description: str) -> AuthorProfile:
     """Create a new profile from the template and save it to disk."""
-    template_path = _AUTHORS_DIR / "_template.json"
-    template = json.loads(template_path.read_text(encoding="utf-8"))
+    template = json.loads(TEMPLATE_PATH.read_text(encoding="utf-8"))
 
     base_id = _slug(display_name)
     author_id = base_id
@@ -113,8 +112,7 @@ def add_example(author_id: str, post_text: str) -> None:
 
 def get_template() -> dict:
     """Return the raw template JSON."""
-    template_path = _AUTHORS_DIR / "_template.json"
-    return json.loads(template_path.read_text(encoding="utf-8"))
+    return json.loads(TEMPLATE_PATH.read_text(encoding="utf-8"))
 
 
 def update_profile_field(author_id: str, field_path: str, value) -> AuthorProfile:

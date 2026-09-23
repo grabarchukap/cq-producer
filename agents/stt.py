@@ -1,48 +1,62 @@
-import asyncio
 import logging
-import os
-import tempfile
-from faster_whisper import WhisperModel
-from config import WHISPER_MODEL, MAX_AUDIO_SIZE_BYTES
+from groq import APIError, AsyncGroq, RateLimitError
+from config import GROQ_API_KEY, GROQ_STT_MODEL, MAX_AUDIO_SIZE_BYTES
+from utils.retry import with_retry
 
 logger = logging.getLogger(__name__)
 
-_model: WhisperModel | None = None
+_client: AsyncGroq | None = None
 
 
-def _get_model() -> WhisperModel:
-    global _model
-    if _model is None:
-        logger.info("Loading Whisper model '%s'...", WHISPER_MODEL)
-        _model = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
-        logger.info("Whisper model loaded.")
-    return _model
+def _get_client() -> AsyncGroq:
+    global _client
+    if _client is None:
+        _client = AsyncGroq(api_key=GROQ_API_KEY)
+    return _client
 
 
 async def transcribe(audio_bytes: bytes) -> str:
-    """Transcribe OGG audio bytes to Russian text using faster-whisper locally."""
+    """Transcribe OGG audio bytes to Russian text via the Groq Whisper API."""
+    if not GROQ_API_KEY:
+        raise ValueError("Распознавание голосовых не настроено — отправь текстом.")
+
     size_mb = len(audio_bytes) / 1024 / 1024
     if len(audio_bytes) > MAX_AUDIO_SIZE_BYTES:
         raise ValueError(
             f"Аудиофайл слишком большой ({size_mb:.1f} МБ). Максимум 25 МБ."
         )
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, _transcribe_sync, audio_bytes)
 
-
-def _transcribe_sync(audio_bytes: bytes) -> str:
-    """Run faster-whisper synchronously (called from executor thread)."""
-    model = _get_model()
-    with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as f:
-        f.write(audio_bytes)
-        tmp_path = f.name
+    # Every API failure becomes a ValueError — callers show its text to the user,
+    # so a raw Groq error body must never reach the chat.
     try:
-        segments, _info = model.transcribe(tmp_path, language="ru", beam_size=5)
-        text = " ".join(seg.text.strip() for seg in segments).strip()
-    finally:
-        os.unlink(tmp_path)
+        text = (await _transcribe_api(audio_bytes)).strip()
+    except RateLimitError:
+        logger.warning("Groq rate limit hit while transcribing %.1f MB", size_mb)
+        raise ValueError(
+            "Лимит распознавания голосовых исчерпан — отправь текстом или попробуй позже."
+        )
+    except APIError as exc:
+        logger.error("Groq transcription failed: %s", exc)
+        raise ValueError(
+            "Не удалось распознать голосовое — попробуй ещё раз или отправь текстом."
+        )
+
     if not text:
         raise ValueError(
             "Не удалось распознать речь — попробуй ещё раз или отправь текстом."
         )
     return text
+
+
+# One retry only: it rides out a short burst, but when the daily free-plan quota
+# is gone there is nothing to wait for.
+@with_retry(max_attempts=2, base_delay=0.5)
+async def _transcribe_api(audio_bytes: bytes) -> str:
+    result = await _get_client().audio.transcriptions.create(
+        file=("voice.ogg", audio_bytes),
+        model=GROQ_STT_MODEL,
+        language="ru",
+        response_format="text",
+    )
+    # response_format="text" yields a plain string; guard against the object form
+    return result if isinstance(result, str) else getattr(result, "text", "")

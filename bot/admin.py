@@ -1,8 +1,14 @@
+import hmac
+import html
+import json
 import logging
+import math
+import time
 
 from telegram import Update
 from telegram.ext import ContextTypes
 
+import bot.case as case
 import profiles.loader as loader
 import storage.db as db
 from bot.keyboards import (
@@ -43,6 +49,33 @@ _K_MENU_MSG           = "main_menu_msg_id"      # shared with handlers.py
 _K_EDIT_PROFILE       = "admin_edit_profile_id"
 _K_EDIT_FIELD         = "admin_edit_field_name"
 _K_EDIT_Q_IDX         = "admin_cq_edit_idx"
+
+# ── Password brute-force protection ───────────────────────────────────────────
+# Kept in module memory (per process) rather than user_data — a user cannot reset
+# it by restarting the conversation.
+_MAX_ATTEMPTS = 5
+_LOCKOUT_SECONDS = 15 * 60
+_attempts: dict[int, int] = {}
+_locked_until: dict[int, float] = {}
+
+
+def _lockout_left(user_id: int) -> int:
+    """Seconds of lockout remaining for this user (0 = not locked)."""
+    until = _locked_until.get(user_id, 0.0)
+    left = until - time.monotonic()
+    if left <= 0:
+        _locked_until.pop(user_id, None)
+        return 0
+    return math.ceil(left)
+
+
+def _register_failure(user_id: int) -> None:
+    count = _attempts.get(user_id, 0) + 1
+    _attempts[user_id] = count
+    if count >= _MAX_ATTEMPTS:
+        _attempts.pop(user_id, None)
+        _locked_until[user_id] = time.monotonic() + _LOCKOUT_SECONDS
+        logger.warning("Admin password locked out for user %s", user_id)
 
 # ── Profile field metadata ────────────────────────────────────────────────────
 
@@ -251,11 +284,11 @@ async def _show_field_editor(
         markup = lang_field_buttons(current)
     elif field_type == "prompt":
         desc = _PROMPT_DESC[field_name]
-        preview = current[:500] if current else "(не задано)"
+        preview = html.escape(current[:500]) if current else "(не задано)"
         text = f"{desc}\n\n<b>Текущий промпт:</b>\n<code>{preview}</code>\n\nОтправь новый текст промпта:"
         markup = text_field_buttons()
     else:  # text, int, phrases
-        preview = current[:300] if current else "(не задано)"
+        preview = html.escape(current[:300]) if current else "(не задано)"
         text = f"{_FIELD_DESC[field_name]}\n\n<b>Текущее значение:</b>\n<code>{preview}</code>\n\nОтправь новое значение:"
         markup = text_field_buttons()
 
@@ -275,19 +308,19 @@ async def _show_back_menu(
     """Return to the appropriate submenu after editing a field."""
     if back_to == "struct_menu":
         await context.bot.edit_message_text(
-            f"Структура поста — <b>{profile.display_name}</b>:",
+            f"Структура поста — <b>{html.escape(profile.display_name)}</b>:",
             chat_id=chat_id, message_id=admin_msg_id,
             parse_mode="HTML", reply_markup=post_structure_menu(profile),
         )
     elif back_to == "prompts_menu":
         await context.bot.edit_message_text(
-            f"Промпты — <b>{profile.display_name}</b>:",
+            f"Промпты — <b>{html.escape(profile.display_name)}</b>:",
             chat_id=chat_id, message_id=admin_msg_id,
             parse_mode="HTML", reply_markup=prompts_menu(),
         )
     else:  # prof_menu
         await context.bot.edit_message_text(
-            f"Редактирование профиля: <b>{profile.display_name}</b>",
+            f"Редактирование профиля: <b>{html.escape(profile.display_name)}</b>",
             chat_id=chat_id, message_id=admin_msg_id,
             parse_mode="HTML", reply_markup=profile_edit_menu(profile),
         )
@@ -337,7 +370,18 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             except Exception:
                 pass
 
-        if text == ADMIN_PASSWORD:
+        user_id = update.effective_user.id
+        left = _lockout_left(user_id)
+        if left:
+            sent = await update.message.chat.send_message(
+                f"Слишком много попыток. Попробуй через {math.ceil(left / 60)} мин.",
+                reply_markup=cancel_auth_button(),
+            )
+            context.user_data[_K_PROMPT_ID] = sent.message_id
+            return
+
+        if hmac.compare_digest(text, ADMIN_PASSWORD):
+            _attempts.pop(user_id, None)
             context.user_data[_K_AUTHED] = True
             context.user_data[_K_STATE] = AdminState.MENU
             msg = await update.message.chat.send_message(
@@ -345,9 +389,15 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             )
             context.user_data[_K_ADMIN_MENU_MSG] = msg.message_id
         else:
+            _register_failure(user_id)
+            left = _lockout_left(user_id)
+            reply = (
+                f"Слишком много попыток. Попробуй через {math.ceil(left / 60)} мин."
+                if left else
+                "Неверный пароль. Попробуй ещё раз:"
+            )
             sent = await update.message.chat.send_message(
-                "Неверный пароль. Попробуй ещё раз:",
-                reply_markup=cancel_auth_button(),
+                reply, reply_markup=cancel_auth_button(),
             )
             context.user_data[_K_PROMPT_ID] = sent.message_id
 
@@ -357,7 +407,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         context.user_data[_K_TOV_NAME] = text
         context.user_data[_K_STATE] = AdminState.AWAIT_TOV_STYLE
         await edit_admin(
-            f"Имя: <b>{text}</b>\n\nТеперь опиши стиль автора (2–5 предложений):",
+            f"Имя: <b>{html.escape(text)}</b>\n\nТеперь опиши стиль автора (2–5 предложений):",
             parse_mode="HTML", reply_markup=back_button(),
         )
 
@@ -369,7 +419,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             profile = loader.create_profile(display_name=name, tone_description=text)
             context.user_data[_K_STATE] = AdminState.MENU
             await edit_admin(
-                f"Профиль <b>{profile.display_name}</b> создан (id: <code>{profile.id}</code>).",
+                f"Профиль <b>{html.escape(profile.display_name)}</b> создан (id: <code>{profile.id}</code>).",
                 parse_mode="HTML", reply_markup=admin_menu(),
             )
         except Exception as exc:
@@ -424,7 +474,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         try:
             save_draft_prompt(text)
             context.user_data[_K_STATE] = AdminState.MENU
-            preview = text[:300]
+            preview = html.escape(text[:300])
             await edit_admin(
                 f"✅ Промпт сохранён.\n\n<code>{preview}{'…' if len(text) > 300 else ''}</code>",
                 parse_mode="HTML", reply_markup=admin_menu(),
@@ -566,7 +616,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         context.user_data[_K_EDIT_PROFILE] = author_id
         context.user_data[_K_STATE] = AdminState.MENU
         await query.edit_message_text(
-            f"Редактирование профиля: <b>{profile.display_name}</b>",
+            f"Редактирование профиля: <b>{html.escape(profile.display_name)}</b>",
             parse_mode="HTML", reply_markup=profile_edit_menu(profile),
         )
 
@@ -579,7 +629,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             return
         context.user_data[_K_STATE] = AdminState.MENU
         await query.edit_message_text(
-            f"Редактирование профиля: <b>{profile.display_name}</b>",
+            f"Редактирование профиля: <b>{html.escape(profile.display_name)}</b>",
             parse_mode="HTML", reply_markup=profile_edit_menu(profile),
         )
 
@@ -591,7 +641,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await query.edit_message_text("Профиль не найден.", reply_markup=back_button())
             return
         await query.edit_message_text(
-            f"Структура поста — <b>{profile.display_name}</b>:",
+            f"Структура поста — <b>{html.escape(profile.display_name)}</b>:",
             parse_mode="HTML", reply_markup=post_structure_menu(profile),
         )
 
@@ -603,7 +653,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await query.edit_message_text("Профиль не найден.", reply_markup=back_button())
             return
         await query.edit_message_text(
-            f"Промпты — <b>{profile.display_name}</b>:",
+            f"Промпты — <b>{html.escape(profile.display_name)}</b>:",
             parse_mode="HTML", reply_markup=prompts_menu(),
         )
 
@@ -792,7 +842,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     # ── Draft prompt editing ──────────────────────────────────────────────────
     elif action == "draft_prompt":
         current = load_draft_prompt()
-        preview = current[:800]
+        preview = html.escape(current[:800])
         context.user_data[_K_STATE] = AdminState.AWAIT_DRAFT_PROMPT
         await query.edit_message_text(
             f"🖊 <b>Промпт черновика кейса</b>\n\n"
@@ -822,40 +872,20 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
 
     elif action == "stuck_retry":
-        from agents.gdocs import export_case
         pending = await db.get_pending_cases()
         if not pending:
             await query.edit_message_text("Нет задач для повтора.", reply_markup=back_button())
             return
         await query.edit_message_text(f"🔄 Запускаю повтор {len(pending)} кейса(ов)...")
-        notifiers = await db.list_notifiers()
         success = 0
         failed = 0
-        import json as _json
         for row in pending:
-            answers = _json.loads(row["answers"])
-            username = row.get("username")
-            try:
-                url = await export_case(answers=answers, username=username)
-                await db.update_case_status(row["id"], "done")
-                first_answer = (answers[0].get("answer") or "").strip() if answers else ""
-                author_part = f"@{username}" if username else "пользователь"
-                text = (
-                    f"📋 Новый кейс от {author_part}\n"
-                    f"Клиент: {first_answer or '—'}\n\n"
-                    f"👉 <a href=\"{url}\">Открыть документ</a>"
-                )
-                for notifier in notifiers:
-                    try:
-                        await context.bot.send_message(
-                            notifier["user_id"], text, parse_mode="HTML",
-                            disable_web_page_preview=True,
-                        )
-                    except Exception:
-                        pass
+            ok = await case.export_and_notify(
+                context.bot, row["id"], json.loads(row["answers"]), row.get("username")
+            )
+            if ok:
                 success += 1
-            except Exception as exc:
-                logger.warning("Retry failed for case %s: %s", row["id"], exc)
+            else:
                 failed += 1
         pending_now = await db.get_pending_cases()
         result = f"✅ Успешно: {success}"
@@ -908,7 +938,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await query.edit_message_text("Вопрос не найден.", reply_markup=back_button())
             return
         await query.edit_message_text(
-            f"<b>Вопрос {idx + 1}</b>\n\n{questions[idx]['text']}",
+            f"<b>Вопрос {idx + 1}</b>\n\n{html.escape(questions[idx]['text'])}",
             parse_mode="HTML", reply_markup=case_question_detail_buttons(idx),
         )
 
@@ -927,7 +957,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         context.user_data[_K_EDIT_Q_IDX] = idx
         context.user_data[_K_STATE] = AdminState.AWAIT_CASE_Q_EDIT
         await query.edit_message_text(
-            f"<b>Текущий текст вопроса {idx + 1}:</b>\n\n{questions[idx]['text']}\n\nОтправь новый текст:",
+            f"<b>Текущий текст вопроса {idx + 1}:</b>\n\n"
+            f"{html.escape(questions[idx]['text'])}\n\nОтправь новый текст:",
             parse_mode="HTML", reply_markup=back_button(),
         )
 
@@ -938,7 +969,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await query.edit_message_text("Вопрос не найден.", reply_markup=back_button())
             return
         await query.edit_message_text(
-            f"Удалить вопрос {idx + 1}?\n\n<i>{questions[idx]['text']}</i>",
+            f"Удалить вопрос {idx + 1}?\n\n<i>{html.escape(questions[idx]['text'])}</i>",
             parse_mode="HTML", reply_markup=case_question_delete_confirm(idx),
         )
 

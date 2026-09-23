@@ -1,11 +1,11 @@
 import json
 import logging
-from pathlib import Path
 import aiosqlite
+from config import DB_PATH
 
 logger = logging.getLogger(__name__)
 
-_DB_PATH = str(Path(__file__).parent / "posts.db")
+_DB_PATH = DB_PATH
 
 
 async def init_db() -> None:

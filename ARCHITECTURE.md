@@ -13,10 +13,12 @@ Telegram-бот «Мысль → Пост». Принимает голосово
 | Язык | Python 3.12+ |
 | Telegram | python-telegram-bot 21 (async, polling / webhook) |
 | LLM | Anthropic API — claude-sonnet-4-6 |
-| STT | OpenAI Whisper API (whisper-1, язык ru) |
+| STT | Groq API — whisper-large-v3, язык ru |
 | БД | SQLite + aiosqlite (WAL mode) |
 | Профили | JSON-файлы + Pydantic v2 |
 | Конфиг | python-dotenv |
+| Экспорт | Google Docs + Drive API (OAuth2) |
+| Деплой | Docker (код read-only, данные в DATA_DIR) |
 
 ---
 
@@ -30,19 +32,26 @@ cq-producer/
 ├── orchestrator.py      # run_pipeline() и run_edit() — склеивает агентов
 │
 ├── agents/
-│   ├── stt.py           # Agent 1: transcribe(audio_bytes) → str  [Whisper API]
+│   ├── stt.py           # Agent 1: transcribe(audio_bytes) → str  [Groq Whisper]
 │   ├── expand.py        # Agent 2: expand(raw_text, profile) → draft
 │   ├── tone.py          # Agent 3: apply_tone(draft, profile) → toned
 │   ├── format.py        # Agent 4: format_post(toned, profile) → formatted
 │   ├── qa.py            # Agent 5: qa_check(formatted, profile) → final_post
-│   └── edit.py          # Agent 6: edit_post(post, request, profile) → new_post
+│   ├── edit.py          # Agent 6: edit_post(post, request, profile) → new_post
+│   ├── gdocs.py         # export_case(answers, username) → URL Google-документа
+│   └── draft_prompt.txt # Промпт черновика кейса (редактируется из админки)
 │
 ├── bot/
 │   ├── states.py        # enum UserState (IDLE/PROCESSING/EDITING), AdminState
 │   ├── keyboards.py     # Все inline keyboards (tov_selection, post_actions, admin_menu…)
 │   ├── handlers.py      # cmd_start, on_input, on_edit, on_post_callback, on_tov_selected
 │   ├── admin.py         # cmd_admin, on_message (FSM), on_callback (inline buttons)
+│   ├── case.py          # Интервью по кейсу + export_and_notify()
 │   └── router.py        # route_text, route_voice, route_callback — центральный роутер
+│
+├── case_questions/
+│   ├── loader.py        # load/add/update/delete вопросов интервью
+│   └── questions.json   # Список вопросов (редактируется из админки)
 │
 ├── profiles/
 │   ├── schema.py        # Pydantic: AuthorProfile, PostStructure, AgentPrompts
@@ -52,19 +61,23 @@ cq-producer/
 │       └── *.json           # Профили авторов (techwriter, motivator, …)
 │
 ├── storage/
-│   ├── db.py            # init_db, is_allowed, add_user, remove_user, list_users, save_post
-│   └── posts.db         # SQLite-файл, создаётся при первом запуске
+│   ├── db.py            # init_db, whitelist, cases, notifiers, save_post
+│   └── posts.db         # SQLite-файл, создаётся при первом запуске (или в DATA_DIR)
 │
 ├── utils/
 │   ├── llm.py           # call_llm(system, user, max_tokens) → str
 │   ├── retry.py         # @with_retry(max_attempts, base_delay) — exponential backoff
-│   └── sanitize.py      # sanitize(text): strip HTML + LLM delimiters, cap 4000 chars
+│   ├── sanitize.py      # sanitize(text): strip HTML + LLM delimiters, cap 4000 chars
+│   └── data_dir.py      # ensure_data_dir(): создаёт DATA_DIR и копирует стартовые данные
 │
 ├── .env                 # Секреты — не коммитить
 ├── .env.example         # Шаблон переменных
 ├── requirements.txt
+├── auth_google.py       # Разовая OAuth2-авторизация Google → token.json
 ├── setup.bat            # Создаёт .venv и устанавливает зависимости (Windows)
-└── start.bat            # Запускает main.py через .venv (Windows)
+├── start.bat            # Запускает main.py через .venv (Windows)
+├── Dockerfile
+└── docker-compose.yml
 ```
 
 ---
@@ -73,7 +86,7 @@ cq-producer/
 
 ```
 ВХОД
- ├─ Голосовое → [Agent 1: STT / Whisper] → транскрипт (str)
+ ├─ Голосовое → [Agent 1: STT / Groq Whisper] → транскрипт (str)
  └─ Текст     → [sanitize()]             → очищенный текст (str)
                         │
                [Agent 2: Expand]
@@ -203,6 +216,67 @@ Callback prefix routing:
 - `tov:*`  → `handlers.on_tov_selected()`
 - `post:*` → `handlers.on_post_callback()`
 - `adm:*`  → `admin.on_callback()`
+- `case:*` → `case.on_callback()`
+
+`case_state` проверяется в роутере раньше `user_state`: пока идёт интервью, любой текст и голосовое
+уходят в `case.on_answer()`.
+
+---
+
+## Интервью по кейсу (bot/case.py)
+
+```
+Кнопка «📋 Я хочу поделиться кейсом»
+        │
+   QUESTION ──(текст или голосовое)──► следующий вопрос
+        │  кнопки: Пропустить / Завершить / Отменить → CONFIRM_* → подтверждение
+        │
+      EXTRA (свободное дополнение)
+        │
+     _finish(): save_case(status=pending) → главное меню
+        │
+  export_and_notify() в фоне:
+     agents/gdocs.export_case() — черновик от Claude + Google-документ
+     → status=done → уведомление всем из таблицы notifiers
+```
+
+`export_and_notify()` — единственное место с этой логикой; её же вызывают повтор при старте
+(`main._retry_pending_cases`) и кнопка «Повторить» в админке. Если выгрузка упала, кейс остаётся
+`pending` и будет повторён при следующем запуске.
+
+---
+
+## Хранение изменяемых данных
+
+Бот пишет: базу, профили авторов, вопросы интервью, промпт черновика и `token.json`.
+Переменная `DATA_DIR` собирает всё это в одну папку — это нужно в Docker, где код смонтирован
+только для чтения. Пути считаются один раз в `config.py` (`DB_PATH`, `AUTHORS_DIR`,
+`QUESTIONS_PATH`, `DRAFT_PROMPT_PATH`), модули берут их оттуда.
+
+| | `DATA_DIR` не задан | `DATA_DIR=/data` |
+|---|---|---|
+| База | `storage/posts.db` | `/data/posts.db` |
+| Профили | `profiles/authors/` | `/data/authors/` |
+| Вопросы | `case_questions/questions.json` | `/data/questions.json` |
+| Промпт черновика | `agents/draft_prompt.txt` | `/data/draft_prompt.txt` |
+| Токен Google | `token.json` | `/data/token.json` |
+
+`utils/data_dir.ensure_data_dir()` (вызывается первой в `post_init`) создаёт папку и копирует
+в неё стартовые профили, вопросы и промпт — только те, которых там ещё нет. Шаблон профиля
+`profiles/authors/_template.json` всегда читается из кода и никогда не перезаписывается.
+
+---
+
+## Запуск в Docker
+
+Пошаговая инструкция развёртывания на сервере — в [DEPLOY.md](DEPLOY.md).
+
+- Контейнер работает не от root (uid 1000), файловая система смонтирована только для чтения,
+  писать можно лишь в `/data` (том `./data`) и `/tmp`.
+- Режим webhook: порт наружу не публикуется, `cloudflared` в соседнем контейнере обращается
+  к боту через общую docker-сеть (`TUNNEL_NETWORK`) по адресу `http://cq-producer:8443`.
+- `credentials.json` в контейнере не нужен: для обновления токена достаточно самого `token.json`.
+  `auth_google.py` запускается локально.
 
 ---
 
@@ -211,7 +285,11 @@ Callback prefix routing:
 - **Whitelist** — таблица `whitelist` в SQLite. `@require_auth` на всех user-хендлерах.
 - **Админка** — `/admin` + пароль из `.env`. Сессия живёт до `adm:exit` или перезапуска.
 - **Sanitize** — `utils/sanitize.py` чистит HTML-теги и LLM-разделители на всём входящем тексте.
-- **Audio limit** — проверка размера ≤ 25 МБ до вызова Whisper API.
+- **Audio limit** — проверка размера ≤ 25 МБ до вызова Groq API.
+- **Пароль админки** — 5 неверных попыток → блокировка на 15 минут (в памяти процесса),
+  сравнение через `hmac.compare_digest`.
+- **HTML-экранирование** — весь текст от пользователя и админа проходит `html.escape()`
+  перед вставкой в сообщения с `parse_mode="HTML"`.
 
 ---
 
@@ -222,12 +300,17 @@ Callback prefix routing:
 | `TELEGRAM_BOT_TOKEN` | ✅ | Токен бота |
 | `ANTHROPIC_API_KEY` | ✅ | Ключ Anthropic (Claude) |
 | `ADMIN_PASSWORD` | ✅ | Пароль /admin |
-| `OPENAI_API_KEY` | ⚠️ опционально | Ключ OpenAI (без него нет STT) |
+| `GROQ_API_KEY` | ⚠️ опционально | Ключ Groq (без него голосовые недоступны) |
 | `DEV_MODE` | — | `true` → polling, `false` → webhook |
 | `WEBHOOK_URL` | если не DEV | Публичный URL |
 | `WEBHOOK_PORT` | — | По умолчанию 8443 |
 | `WEBHOOK_SECRET_TOKEN` | — | Рекомендуется для webhook |
 | `CLAUDE_MODEL` | — | По умолчанию claude-sonnet-4-6 |
+| `GROQ_STT_MODEL` | — | По умолчанию whisper-large-v3 |
+| `DATA_DIR` | — | Папка для изменяемых данных; пусто → файлы рядом с кодом |
+| `GOOGLE_TOKEN_FILE` | — | По умолчанию `DATA_DIR/token.json` (или `token.json`) |
+| `GOOGLE_CREDENTIALS_FILE` | — | Нужен только для `auth_google.py` |
+| `GOOGLE_DRIVE_FOLDER_ID` | для кейсов | Папка Drive, куда складываются документы |
 
 ---
 
@@ -239,6 +322,9 @@ Callback prefix routing:
 - Проверка размера файла в `stt.py` выполняется ДО `@with_retry`
 - `on_callback` в admin проверяет `_K_AUTHED` перед любым действием
 - `route_voice` проверяет `admin_state` наравне с `route_text`
+- Ошибки Groq в `stt.py` переводятся в `ValueError` с понятным текстом — хендлеры показывают
+  пользователю `str(exc)`, поэтому сырой ответ API не должен до них доходить
+- Выгрузка кейса идёт в фоне (`asyncio.create_task`) — пользователь не ждёт Google API
 
 ---
 
@@ -259,6 +345,23 @@ author_id  TEXT
 raw_input  TEXT
 final_post TEXT
 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+```
+
+**`cases`** — интервью по кейсам (`answers` — JSON со списком вопрос/ответ):
+```sql
+id         INTEGER PRIMARY KEY AUTOINCREMENT
+user_id    INTEGER
+username   TEXT
+answers    TEXT
+status     TEXT DEFAULT 'pending'   -- pending → done
+created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+```
+
+**`notifiers`** — кому приходят уведомления о новых кейсах:
+```sql
+user_id  INTEGER PRIMARY KEY
+username TEXT
+added_at DATETIME DEFAULT CURRENT_TIMESTAMP
 ```
 
 WAL mode включён при инициализации — читатели не блокируют писателей.

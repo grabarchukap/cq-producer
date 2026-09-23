@@ -1,0 +1,30 @@
+services:
+  bot:
+    build: .
+    env_file: .env
+    environment:
+      DATA_DIR: /data
+    volumes:
+      # Everything the bot writes (database, profiles, questions, token.json).
+      # Must be writable by uid 1000.
+      - ./data:/data
+    # The code and the rest of the filesystem stay read-only
+    read_only: true
+    tmpfs:
+      - /tmp
+    restart: unless-stopped
+    # No published ports: cloudflared reaches the bot over the shared network as
+    # http://cq-producer:8443, so the port is never exposed to the LAN.
+    # A unique alias instead of the service name "bot" — other bots on the same
+    # network may have a service called "bot" too.
+    networks:
+      tunnel:
+        aliases:
+          - cq-producer
+
+networks:
+  tunnel:
+    # Docker network shared with the cloudflared container (created once, outside
+    # this project). Its name is set by TUNNEL_NETWORK in .env. See DEPLOY.md.
+    external: true
+    name: ${TUNNEL_NETWORK:-tgbots}

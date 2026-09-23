@@ -1,4 +1,5 @@
 import functools
+import html
 import logging
 
 from telegram import ReplyKeyboardRemove, Update
@@ -163,7 +164,7 @@ async def on_tov_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await query.message.delete()
     context.user_data.pop(_K_TOV_MSG, None)
     msg = await chat.send_message(
-        f"Выбран стиль: <b>{profile.display_name}</b>\n\n"
+        f"Выбран стиль: <b>{html.escape(profile.display_name)}</b>\n\n"
         "Отправь голосовое сообщение или текст — создам пост.",
         parse_mode="HTML",
     )

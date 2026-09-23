@@ -3,7 +3,7 @@ import logging
 from datetime import datetime
 from pathlib import Path
 
-from config import GOOGLE_CREDENTIALS_FILE, GOOGLE_DRIVE_FOLDER_ID, GOOGLE_TOKEN_FILE
+from config import DRAFT_PROMPT_PATH, GOOGLE_DRIVE_FOLDER_ID, GOOGLE_TOKEN_FILE
 from utils.llm import call_llm
 
 logger = logging.getLogger(__name__)
@@ -13,7 +13,7 @@ _SCOPES = [
     "https://www.googleapis.com/auth/drive",
 ]
 
-_DRAFT_PROMPT_PATH = Path(__file__).parent / "draft_prompt.txt"
+_DRAFT_PROMPT_PATH = DRAFT_PROMPT_PATH
 
 
 def load_draft_prompt() -> str:
@@ -133,7 +133,7 @@ async def export_case(
     author_part = f"@{username}" if username else "пользователь"
     title = f"Кейс: {first_answer or author_part} — {date_str}"
 
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     docs_service, drive_service = await loop.run_in_executor(None, _build_services)
     url = await loop.run_in_executor(
         None, _create_doc_sync, docs_service, drive_service, title, qa_text, draft_text

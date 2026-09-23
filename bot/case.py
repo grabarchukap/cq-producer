@@ -1,4 +1,5 @@
 import asyncio
+import html
 import logging
 
 from telegram import Update
@@ -15,7 +16,7 @@ from bot.keyboards import (
 from bot.states import CaseState
 from case_questions.loader import load_questions
 from orchestrator import transcribe_audio
-from storage.db import get_pending_cases, list_notifiers, save_case, update_case_status
+from storage.db import list_notifiers, save_case, update_case_status
 from agents.gdocs import export_case
 from utils.sanitize import sanitize
 
@@ -85,7 +86,10 @@ async def _show_question(
     questions: list[dict],
 ) -> None:
     total = len(questions)
-    text = f"<b>Вопрос {idx + 1} из {total}</b>\n\n{questions[idx]['text']}"
+    text = (
+        f"<b>Вопрос {idx + 1} из {total}</b>\n\n"
+        f"{html.escape(questions[idx]['text'])}"
+    )
     msg = await context.bot.send_message(
         chat_id, text, parse_mode="HTML",
         reply_markup=case_question_buttons(),
@@ -106,30 +110,34 @@ async def _show_extra(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 # ── Finish / cancel ───────────────────────────────────────────────────────────
 
-async def _export_and_notify(
+async def export_and_notify(
     bot,
     case_id: int,
     answers: list[dict],
     username: str | None,
-) -> None:
-    """Export case to Google Docs and notify all notifiers. Called after _finish cleanup."""
+) -> bool:
+    """Export a case to Google Docs and notify the notifiers. False if export failed.
+
+    Shared by the interview itself, the startup retry and the admin panel retry.
+    """
     try:
         url = await export_case(answers=answers, username=username)
         await update_case_status(case_id, "done")
     except Exception as exc:
         logger.error("Case export failed (id=%s): %s", case_id, exc)
         await update_case_status(case_id, "pending")
-        return
+        return False
 
-    # Send notifications
     try:
         notifiers = await list_notifiers()
         first_answer = (answers[0].get("answer") or "").strip() if answers else ""
-        author_part = f"@{username}" if username else "пользователь"
+        author_part = f"@{html.escape(username)}" if username else "пользователь"
+        # User-written text goes into an HTML message — escape it or Telegram
+        # rejects the whole notification on a stray "<" or "&".
         text = (
             f"📋 Новый кейс от {author_part}\n"
-            f"Клиент: {first_answer or '—'}\n\n"
-            f"👉 <a href=\"{url}\">Открыть документ</a>"
+            f"Клиент: {html.escape(first_answer) or '—'}\n\n"
+            f"👉 <a href=\"{html.escape(url, quote=True)}\">Открыть документ</a>"
         )
         for notifier in notifiers:
             try:
@@ -141,6 +149,8 @@ async def _export_and_notify(
                 logger.warning("Failed to notify user %s: %s", notifier["user_id"], exc)
     except Exception as exc:
         logger.error("Notification error: %s", exc)
+
+    return True
 
 
 async def _finish(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -168,7 +178,7 @@ async def _finish(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
     # Fire-and-forget export (doesn't block user)
     if case_id is not None:
         asyncio.create_task(
-            _export_and_notify(context.bot, case_id, answers, username)
+            export_and_notify(context.bot, case_id, answers, username)
         )
 
 
